@@ -1,8 +1,7 @@
 use super::{
-    read_to_end, ClientConfigBuilder, Config, Endpoint, EndpointBuilder, NewStream,
-    ServerConfigBuilder,
+    ClientConfigBuilder, Config, Endpoint, EndpointBuilder, NewStream, ServerConfigBuilder,
 };
-use futures::{Future, Stream};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use slog::{Drain, Logger, KV};
 use std::{
     fmt, io,
@@ -53,7 +52,7 @@ fn run_echo(client_addr: SocketAddr, server_addr: SocketAddr) {
     server.listen(server_config.build());
     let server_sock = UdpSocket::bind(server_addr).unwrap();
     let server_addr = server_sock.local_addr().unwrap();
-    let (_, server_driver, server_incoming) = server.from_socket(server_sock).unwrap();
+    let (_, server_driver, mut server_incoming) = server.from_socket(server_sock).unwrap();
 
     let mut client_config = ClientConfigBuilder::default();
     client_config.add_certificate_authority(cert).unwrap();
@@ -63,54 +62,80 @@ fn run_echo(client_addr: SocketAddr, server_addr: SocketAddr) {
     let (client, client_driver, _) = client.bind(client_addr).unwrap();
 
     let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
-    runtime.spawn(server_driver.map_err(|e| panic!("server driver failed: {}", e)));
-    runtime.spawn(client_driver.map_err(|e| panic!("client driver failed: {}", e)));
-    runtime.spawn(server_incoming.for_each(move |conn| {
-        tokio_current_thread::spawn(conn.incoming.map_err(|_| ()).for_each(echo));
-        Ok(())
-    }));
+    runtime.spawn(
+        server_driver
+            .map_err(|e| panic!("server driver failed: {}", e))
+            .compat(),
+    );
+    runtime.spawn(
+        client_driver
+            .map_err(|e| panic!("client driver failed: {}", e))
+            .compat(),
+    );
+    let slog = log.new(o!("side" => "Server"));
+    runtime.spawn(
+        Box::pin(
+            async move {
+                while let Some(hs) = await!(server_incoming.next()) {
+                    info!(slog, "handshaking");
+                    let (_, mut streams) = await!(hs.finish()).expect("server handshake failed");
+                    info!(slog, "established");
+                    let slog = slog.clone();
+                    tokio_current_thread::spawn(
+                        Box::pin(
+                            async move {
+                                while let Some(stream) = await!(streams.next()) {
+                                    await!(echo(&slog, stream));
+                                }
+                            },
+                        )
+                        .map(|()| -> Result<(), ()> { Ok(()) })
+                        .compat(),
+                    );
+                }
+            },
+        )
+        .map(|()| -> Result<(), ()> { Ok(()) })
+        .compat(),
+    );
 
-    info!(log, "connecting from {} to {}", client_addr, server_addr);
+    let clog = log.new(o!("side" => "Client"));
+    info!(clog, "connecting from {} to {}", client_addr, server_addr);
     runtime
         .block_on(
-            client
-                .connect(&server_addr, "localhost")
-                .unwrap()
-                .map_err(|e| panic!("connection failed: {}", e))
-                .and_then(move |conn| {
-                    let conn = conn.connection;
-                    let stream = conn.open_bi();
-                    stream
-                        .map_err(|_| ())
-                        .and_then(move |stream| {
-                            tokio::io::write_all(stream, b"foo".to_vec())
-                                .map_err(|e| panic!("write: {}", e))
-                        })
-                        .and_then(|(stream, _)| {
-                            tokio::io::shutdown(stream).map_err(|e| panic!("finish: {}", e))
-                        })
-                        .and_then(move |stream| {
-                            read_to_end(stream, usize::max_value())
-                                .map_err(|e| panic!("read: {}", e))
-                        })
-                        .and_then(move |(_, data)| {
-                            assert_eq!(&data[..], b"foo");
-                            conn.close(0, b"done").map_err(|_| unreachable!())
-                        })
-                }),
+            Box::pin(
+                async {
+                    let hs = client.connect(&server_addr, "localhost").unwrap();
+                    let (conn, _) = await!(hs.finish()).expect("client handshake failed");
+                    info!(clog, "established");
+                    let mut stream = await!(conn.open_bi()).expect("connection lost");
+                    info!(clog, "stream opened");
+                    await!(stream.send.write_all(b"foo")).expect("write error");
+                    await!(stream.send.finish()).expect("connection lost");
+                    info!(clog, "message sent");
+                    let reply =
+                        await!(stream.recv.read_to_end(usize::max_value())).expect("read error");
+                    info!(clog, "message received");
+                    assert_eq!(&reply[..], b"foo");
+                    await!(conn.close(0, b"done"));
+                },
+            )
+            .map(|()| -> Result<(), ()> { Ok(()) })
+            .compat(),
         )
         .unwrap();
 }
 
-fn echo(stream: NewStream) -> Box<dyn Future<Item = (), Error = ()>> {
+async fn echo(log: &Logger, stream: NewStream) {
     match stream {
-        NewStream::Bi(stream) => Box::new(
-            tokio::io::read_to_end(stream, Vec::new())
-                .and_then(|(stream, data)| tokio::io::write_all(stream, data))
-                .and_then(|(stream, _)| tokio::io::shutdown(stream))
-                .map_err(|_| ())
-                .map(|_| ()),
-        ),
+        NewStream::Bi(mut stream) => {
+            info!(log, "got stream");
+            let data = await!(stream.recv.read_to_end(usize::max_value())).unwrap();
+            info!(log, "read {} bytes", data.len());
+            await!(stream.send.write_all(&data)).unwrap();
+            await!(stream.send.finish()).unwrap();
+            info!(log, "reply sent");
+        }
         _ => panic!("only bidi streams allowed"),
     }
 }

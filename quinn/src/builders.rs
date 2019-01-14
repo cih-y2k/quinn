@@ -1,15 +1,9 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::io;
 use std::net::ToSocketAddrs;
-use std::rc::Rc;
 use std::str;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
-use fnv::FnvHashMap;
-use futures::stream::futures_unordered::FuturesUnordered;
 use quinn_proto as quinn;
 use rustls::{KeyLogFile, ProtocolVersion, TLSError};
 use slog::Logger;
@@ -18,7 +12,7 @@ use quinn_proto::{Config, ServerConfig};
 
 use crate::tls::{Certificate, CertificateChain, PrivateKey};
 use crate::udp::UdpSocket;
-use crate::{Driver, Endpoint, EndpointInner, Incoming};
+use crate::{Driver, Endpoint, EndpointInner, IncomingConnections};
 
 /// A helper for constructing an `Endpoint`.
 pub struct EndpointBuilder<'a> {
@@ -43,7 +37,7 @@ impl<'a> EndpointBuilder<'a> {
     pub fn bind<T: ToSocketAddrs>(
         self,
         addr: T,
-    ) -> Result<(Endpoint, Driver, Incoming), EndpointError> {
+    ) -> Result<(Endpoint, Driver, IncomingConnections), EndpointError> {
         let socket = std::net::UdpSocket::bind(addr).map_err(EndpointError::Socket)?;
         self.from_socket(socket)
     }
@@ -52,7 +46,7 @@ impl<'a> EndpointBuilder<'a> {
     pub fn from_socket(
         self,
         socket: std::net::UdpSocket,
-    ) -> Result<(Endpoint, Driver, Incoming), EndpointError> {
+    ) -> Result<(Endpoint, Driver, IncomingConnections), EndpointError> {
         let reactor = if let Some(x) = self.reactor {
             Cow::Borrowed(x)
         } else {
@@ -60,26 +54,19 @@ impl<'a> EndpointBuilder<'a> {
         };
         let addr = socket.local_addr().map_err(EndpointError::Socket)?;
         let socket = UdpSocket::from_std(socket, &reactor).map_err(EndpointError::Socket)?;
-        let (send, recv) = futures::sync::mpsc::channel(4);
-        let rc = Rc::new(RefCell::new(EndpointInner {
-            log: self.logger.clone(),
+        let endpoint = quinn::Endpoint::new(self.logger, self.config, self.server_config)?;
+        let inner = Arc::new(Mutex::new(EndpointInner::new(
+            endpoint,
             socket,
-            inner: quinn::Endpoint::new(self.logger, self.config, self.server_config)?,
-            outgoing: VecDeque::new(),
-            epoch: Instant::now(),
-            pending: FnvHashMap::default(),
-            timers: FuturesUnordered::new(),
-            incoming: send,
-            driver: None,
-            ipv6: addr.is_ipv6(),
-        }));
+            addr.is_ipv6(),
+        )));
         Ok((
             Endpoint {
-                inner: rc.clone(),
+                inner: inner.clone(),
                 default_client_config: self.client_config,
             },
-            Driver(rc),
-            recv,
+            Driver(inner.clone()),
+            IncomingConnections(inner),
         ))
     }
 

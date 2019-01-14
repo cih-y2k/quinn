@@ -22,15 +22,15 @@ travis-ci = { repository = "djc/quinn" }
 [dependencies]
 bytes = "0.4.7"
 failure = "0.1"
-fnv = "1.0.6"
-futures = "0.1.21"
+fxhash = "0.2.1"
+futures-preview = { version = "0.3.0-alpha.11", features = ["compat"] }
+futures_01 = { version = "0.1.25", package = "futures" }
 quinn-proto = { path = "../quinn-proto", version = "0.1.0" }
 rand = "0.6"
 rustls = { git = "https://github.com/Ralith/rustls.git", rev = "6cb47566ee1a2bb480bfd18243be5f02fd355360", features = ["quic"] }
 slog = "2.1"
-tokio-reactor = "0.1.1"
-tokio-io = "0.1"
-tokio-timer = "0.2.1"
+tokio-reactor = { git = "https://github.com/tokio-rs/tokio.git", rev = "2d3698b14dc342f412dd43febc3ab74c4ca83caf" }
+tokio-timer = { git = "https://github.com/tokio-rs/tokio.git", rev = "2d3698b14dc342f412dd43febc3ab74c4ca83caf" }
 untrusted = "0.6.2"
 webpki = "0.19"
 webpki-roots = "0.16"
@@ -41,8 +41,8 @@ mio = "0.6"
 [dev-dependencies]
 slog-term = "2"
 structopt = "0.2.7"
-tokio = "0.1.6"
-tokio-current-thread = "0.1"
+tokio = { git = "https://github.com/tokio-rs/tokio.git", rev = "2d3698b14dc342f412dd43febc3ab74c4ca83caf" }
+tokio-current-thread = { git = "https://github.com/tokio-rs/tokio.git", rev = "2d3698b14dc342f412dd43febc3ab74c4ca83caf" }
 url = "1.7"
 rcgen = "0.2"
 directories = "1.0.2"
