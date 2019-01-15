@@ -56,6 +56,7 @@ mod builders;
 mod platform;
 pub mod tls;
 mod udp;
+pub mod zero_rtt;
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -319,7 +320,22 @@ impl ClientHandshake {
         Ok((self.conn, incoming))
     }
 
-    // TODO: 0-RTT
+    /// Convert into a 0-RTT connection
+    ///
+    /// Use with caution: 0-RTT data might be usable in a replay attack, and should therefore never
+    /// invoke non-idempotent operations.
+    ///
+    /// Even if a connection succeeds, 0-RTT data might be rejected by the server due to a
+    /// configuration change. When this occurs, all streams are returned to their initial state,
+    /// therefore any application data sent in a rejected 0-RTT flight will not be automatically
+    /// retransmitted.
+    pub fn zero_rtt(self) -> Result<zero_rtt::Connection, Self> {
+        if self.conn.get(|x| x.has_0rtt()) {
+            Ok(zero_rtt::Connection::new(self.conn, self.connected))
+        } else {
+            Err(self)
+        }
+    }
 
     /// The peer's UDP address.
     pub fn remote_address(&self) -> SocketAddr {
