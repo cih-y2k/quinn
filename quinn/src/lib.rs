@@ -257,7 +257,7 @@ impl Endpoint {
         &'a self,
         addr: &SocketAddr,
         server_name: &str,
-    ) -> Result<Handshake, ConnectError> {
+    ) -> Result<ClientHandshake, ConnectError> {
         self.connect_with(&self.default_client_config, addr, server_name)
     }
 
@@ -270,7 +270,7 @@ impl Endpoint {
         config: &ClientConfig,
         addr: &SocketAddr,
         server_name: &str,
-    ) -> Result<Handshake, ConnectError> {
+    ) -> Result<ClientHandshake, ConnectError> {
         let mut inner = self.inner.lock().unwrap();
         let addr = if inner.ipv6 {
             SocketAddr::V6(ensure_ipv6(addr))
@@ -281,34 +281,34 @@ impl Endpoint {
             .endpoint
             .connect(addr, &config.tls_config, server_name)?;
         let mut conn = ConnState::new();
-        let mut hs = Handshake::new(self.inner.clone(), ch);
         let (send, recv) = oneshot::channel();
         conn.connected = Some(send);
-        hs.connected = Some(recv);
         inner.insert(ch, conn);
-        Ok(hs)
+        Ok(ClientHandshake::new(self.inner.clone(), ch, recv))
     }
 }
 
-/// A connection in the process of becoming established
-pub struct Handshake {
+/// An outgoing connection that has not yet been established
+pub struct ClientHandshake {
     conn: Connection,
-    connected: Option<oneshot::Receiver<()>>,
+    connected: oneshot::Receiver<()>,
 }
 
-impl Handshake {
-    fn new(inner: Arc<Mutex<EndpointInner>>, ch: ConnectionHandle) -> Self {
-        Handshake {
+impl ClientHandshake {
+    fn new(
+        inner: Arc<Mutex<EndpointInner>>,
+        ch: ConnectionHandle,
+        connected: oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
             conn: Connection::new(inner, ch),
-            connected: None,
+            connected,
         }
     }
 
     /// Complete the handshake.
     pub async fn finish(self) -> Result<(Connection, IncomingStreams), ConnectionError> {
-        if let Some(connected) = self.connected {
-            await!(connected).unwrap();
-        }
+        await!(self.connected).unwrap();
         self.conn
             .0
             .inner
@@ -319,7 +319,60 @@ impl Handshake {
         Ok((self.conn, incoming))
     }
 
-    // TODO: 0/0.5-RTT
+    // TODO: 0-RTT
+
+    /// The peer's UDP address.
+    pub fn remote_address(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+}
+
+/// An outgoing connection that has not yet been established
+pub struct ServerHandshake {
+    conn: Connection,
+    /// If None, already connected
+    connected: Option<oneshot::Receiver<()>>,
+}
+
+impl ServerHandshake {
+    fn new(inner: Arc<Mutex<EndpointInner>>, ch: ConnectionHandle) -> Self {
+        Self {
+            conn: Connection::new(inner, ch),
+            connected: None,
+        }
+    }
+
+    /// Complete the handshake.
+    pub async fn finish(self) -> Result<(Connection, IncomingStreams), ConnectionError> {
+        let (conn, incoming) = self.into_half_rtt();
+        let incoming = await!(incoming)?;
+        Ok((conn, incoming))
+    }
+
+    /// Convert into a [`Connection`] that can send 0.5-RTT data.
+    ///
+    /// Use with caution: 0.5-RTT data is sent before the absence of a man-in-the-middle attacker
+    /// has been confirmed.
+    ///
+    /// Additionally returns future that will yield the connection's [`IncomingStreams`] when the
+    /// connection is established.
+    pub fn into_half_rtt(
+        self,
+    ) -> (
+        Connection,
+        impl Future<Output = Result<IncomingStreams, ConnectionError>>,
+    ) {
+        let ServerHandshake { conn, connected } = self;
+        let incoming = IncomingStreams(conn.0.clone());
+        let fut = async move {
+            if let Some(connected) = connected {
+                await!(connected).unwrap();
+            }
+            incoming.0.inner.lock().unwrap().check_err(incoming.0.ch)?;
+            Ok(incoming)
+        };
+        (conn, fut)
+    }
 
     /// The peer's UDP address.
     pub fn remote_address(&self) -> SocketAddr {
@@ -1052,7 +1105,7 @@ impl From<ReadError> for io::Error {
 pub struct IncomingConnections(Arc<Mutex<EndpointInner>>);
 
 impl Stream for IncomingConnections {
-    type Item = Handshake;
+    type Item = ServerHandshake;
     fn poll_next(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
         let cloned = self.0.clone();
         let inner = &mut *self.0.lock().unwrap();
@@ -1061,7 +1114,7 @@ impl Stream for IncomingConnections {
         }
         if let Some(ch) = inner.incoming.pop_front() {
             inner.endpoint.accept();
-            let mut hs = Handshake::new(cloned, ch);
+            let mut hs = ServerHandshake::new(cloned, ch);
             if inner.endpoint.connection(ch).is_handshaking() {
                 let (send, recv) = oneshot::channel();
                 inner.conns[ch.0].as_mut().unwrap().connected = Some(send);

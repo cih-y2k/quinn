@@ -157,7 +157,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(root: Rc<PathBuf>, log: Logger, conn: quinn::Handshake) {
+async fn handle_connection(root: Rc<PathBuf>, log: Logger, conn: quinn::ServerHandshake) {
     info!(
         log,
         "connection incoming from {remote}",
