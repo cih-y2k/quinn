@@ -515,6 +515,11 @@ impl Connection {
     pub fn timeout(&mut self, now: u64, timer: Timer) -> bool {
         match timer {
             Timer::Close => {
+                if let State::Closed(_) = self.state {
+                    self.events.push_back(Event::ConnectionLost {
+                        reason: ConnectionError::TimedOut,
+                    });
+                }
                 self.io.timer_stop(Timer::Idle);
                 self.state = State::Drained;
                 return self.app_closed;
@@ -1301,14 +1306,23 @@ impl Connection {
             }
             State::Closed(_) => {
                 for frame in frame::Iter::new(packet.payload.into()) {
-                    match frame {
-                        Frame::ConnectionClose(_) | Frame::ApplicationClose(_) => {
-                            trace!(self.log, "draining");
-                            self.state = State::Draining;
-                            return Ok(());
+                    let peer_reason = match frame {
+                        Frame::ApplicationClose(reason) => {
+                            ConnectionError::ApplicationClosed { reason }
                         }
-                        _ => {}
-                    }
+                        Frame::ConnectionClose(reason) => {
+                            ConnectionError::ConnectionClosed { reason }
+                        }
+                        _ => {
+                            continue;
+                        }
+                    };
+                    self.events.push_back(Event::ConnectionLost {
+                        reason: peer_reason,
+                    });
+                    trace!(self.log, "draining");
+                    self.state = State::Draining;
+                    return Ok(());
                 }
                 Ok(())
             }
