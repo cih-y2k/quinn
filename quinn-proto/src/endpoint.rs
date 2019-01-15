@@ -85,6 +85,9 @@ impl Endpoint {
 
     /// Get an application-facing event
     pub fn poll(&mut self) -> Option<(ConnectionHandle, Event)> {
+        if let Some(conn) = self.incoming.pop_front() {
+            return Some((conn, Event::Handshaking));
+        }
         while let Some(&conn) = self.eventful_conns.iter().next() {
             if let Some(e) = self.connections[conn.0].poll() {
                 return Some((conn, e));
@@ -187,7 +190,6 @@ impl Endpoint {
     /// Connection is either ready to accept data or failed.
     fn conn_ready(&mut self, conn: ConnectionHandle) {
         if self.connections[conn.0].side().is_server() {
-            self.incoming_handshakes -= 1;
             self.incoming.push_back(conn);
         }
         if self.config.local_cid_len != 0 && !self.connections[conn.0].is_closed() {
@@ -470,9 +472,7 @@ impl Endpoint {
         // Local CID used for stateless packets
         let temp_loc_cid = ConnectionId::random(&mut self.rng, self.config.local_cid_len);
 
-        if self.incoming.len() + self.incoming_handshakes
-            == self.server_config.as_ref().unwrap().accept_buffer as usize
-        {
+        if self.incoming_handshakes == self.server_config.as_ref().unwrap().accept_buffer as usize {
             debug!(self.log, "rejecting connection due to full accept buffer");
             self.io.push_back(Io::Transmit {
                 destination: remote,
@@ -747,8 +747,13 @@ impl Endpoint {
         self.dirty_conns.insert(conn);
     }
 
-    pub fn accept(&mut self) -> Option<ConnectionHandle> {
-        self.incoming.pop_front()
+    /// Free a handshake slot for reuse
+    ///
+    /// Every time an [`Event::Handshaking`] is emitted, a slot is consumed, up to a limit of
+    /// [`ServerConfig.accept_buffer`]. Calling this indicates the application's acceptance of that
+    /// connection and releases the slot for reuse.
+    pub fn accept(&mut self) {
+        self.incoming_handshakes -= 1;
     }
 
     pub fn accept_stream(&mut self, conn: ConnectionHandle) -> Option<StreamId> {
@@ -957,6 +962,8 @@ impl From<crypto::TLSError> for EndpointError {
 /// Events of interest to the application
 #[derive(Debug)]
 pub enum Event {
+    /// An incoming connection has begun handshake procedure
+    Handshaking,
     /// A connection was successfully established.
     Connected,
     /// A connection was lost.
